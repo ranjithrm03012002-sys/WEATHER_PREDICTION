@@ -169,18 +169,3 @@ with torch.no_grad():
         break
 
 np.savetxt("attention_weights.csv", example_attention, delimiter=",")
-
-
-class BaselineLSTM(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim):
-        super().__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
-        self.fc = nn.Linear(hidden_dim, output_dim)
-
-    def forward(self, x):
-        outputs, (h,c) = self.lstm(x)
-        output = self.fc(outputs[:, -1, :]).unsqueeze(1)
-        return output.repeat(1, output_seq_len, 1)
-
-baseline = BaselineLSTM(features, 128, features)
-optimizer_b = torch.optim.Adam(baseline.parameters(), lr=1e-3)
