@@ -1,600 +1,706 @@
 """
-Advanced Time Series Forecasting with Deep Learning and Explainability
-Single-file, production-quality Python script that:
- - Programmatically generates a synthetic multivariate time series dataset
- - Trains a PyTorch LSTM forecasting model with advanced optimization (OneCycleLR + EarlyStopping)
- - Trains a statistical baseline (SARIMAX) and compares MAE, RMSE, MAPE
- - Applies Integrated Gradients via Captum to explain predictions for a selected forecast window
- - Exports results and a short textual summary file
+Advanced Time Series Forecasting with Deep Learning and Attention (Single-file implementation)
 
-Dependencies:
- - numpy, pandas, matplotlib, scikit-learn, torch, statsmodels, captum
-Install (example):
- pip install numpy pandas matplotlib scikit-learn torch statsmodels captum
+What this file provides:
+- Synthetic multivariate time series generator with non-stationarity + multiple seasonalities
+- LSTM with additive (Bahdanau-style) attention (object-oriented, PyTorch)
+- MLP baseline (PyTorch)
+- SARIMA baseline (statsmodels)
+- Hyperparameter search (Optuna if available, otherwise randomized search)
+- Training, evaluation (MAE, RMSE, MAPE), and attention visualization
+- Full reproducibility seed and easy-to-run CLI-style section at bottom
 
-Notes:
- - The script is written to be run as a script (python forecast_xai.py).
- - All configurable hyperparameters are at the top in the CONFIG block.
+Usage:
+- Install requirements (recommended): 
+    pip install numpy pandas scipy matplotlib scikit-learn torch statsmodels optuna
+  (optuna is optional; if missing the script will fall back to randomized search)
+- Run:
+    python timeseries_attention_project.py
+
+This file is intended to be run as a script. It is self-contained and documented.
+
+Author: ChatGPT (code-only deliverable requested)
+Date: 2025-11-25
 """
 
-# -----------------------
-# CONFIG / SETUP (ESSENTIAL)
-# -----------------------
 import os
 import math
+import time
 import random
-import warnings
-from dataclasses import dataclass
+from typing import Tuple, Dict, Any, List
 
 import numpy as np
 import pandas as pd
-
+from scipy import signal
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error
+import matplotlib.pyplot as plt
 
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
-from statsmodels.tsa.statespace.sarimax import SARIMAX
+# SARIMA baseline
+import statsmodels.api as sm
 
-# Captum for Integrated Gradients
-from captum.attr import IntegratedGradients
+# Try to import optuna (optional). If not present, we'll fallback to randomized search.
+try:
+    import optuna
+    OPTUNA_AVAILABLE = True
+except Exception:
+    OPTUNA_AVAILABLE = False
 
-# plotting (optional)
-import matplotlib.pyplot as plt
-
-warnings.filterwarnings("ignore")
+# ---------------------------
+# Utilities and config
+# ---------------------------
+SEED = 42
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+random.seed(SEED)
 
-@dataclass
-class Config:
-    seed: int = 42
+def set_seed(seed: int):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
 
-    # Data generation
-    n_series: int = 1              # number of separate series (we generate one multivariate series)
-    n_timesteps: int = 24 * 90     # ~90 days of hourly data (2160)
-    freq: str = "H"                # hourly
-    n_features: int = 5            # minimum 5 features required
-    forecast_horizon: int = 24     # predict next 24 hours
-    input_window: int = 168        # lookback (one week)
-    noise_scale: float = 0.1       # base noise
+set_seed(SEED)
 
-    # Model hyperparams
-    model_type: str = "LSTM"       # LSTM implementation
-    hidden_size: int = 128
-    num_layers: int = 2
-    dropout: float = 0.2
+def rmse(y_true, y_pred):
+    return np.sqrt(np.mean((y_true - y_pred) ** 2))
 
-    # Training
-    batch_size: int = 64
-    epochs: int = 60
-    lr_max: float = 1e-3
-    weight_decay: float = 1e-5
+def mape(y_true, y_pred):
+    # avoid divide-by-zero by adding small epsilon
+    eps = 1e-8
+    return np.mean(np.abs((y_true - y_pred) / (np.abs(y_true) + eps))) * 100.0
 
-    # Early stopping
-    early_stop_patience: int = 8
-    early_stop_min_delta: float = 1e-4
-
-    # Misc
-    save_dir: str = "results_ts"
-    device = DEVICE
-
-cfg = Config()
-os.makedirs(cfg.save_dir, exist_ok=True)
-
-# reproducibility
-random.seed(cfg.seed)
-np.random.seed(cfg.seed)
-torch.manual_seed(cfg.seed)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(cfg.seed)
-
-# -----------------------
-# 1) Synthetic dataset generation (multivariate)
-# -----------------------
-def generate_multivariate_series(n_steps, n_features, freq="H", seed=cfg.seed, noise_scale=0.1):
+# ---------------------------
+# 1) Dataset generator
+# ---------------------------
+class SyntheticMultivariateSeries:
     """
-    Generate a multivariate timeseries with:
-     - linear + nonlinear trend
-     - multiple seasonalities (daily + weekly)
-     - interactions between features
-     - controlled Gaussian noise
-    Returns: DataFrame with datetime index and columns f0..f{n_features-1}
+    Generates a multivariate time series with:
+     - long-term trend (non-stationary)
+     - multiple seasonal components (different frequencies)
+     - an exogenous slowly varying signal
+     - heteroscedastic noise (to make it more realistic)
+    Produces a pandas DataFrame with columns: ['feature_0', 'feature_1', 'feature_2']
     """
-    rng = pd.date_range(start="2020-01-01", periods=n_steps, freq=freq)
-    t = np.arange(n_steps).astype(float)
+    def __init__(self, n_steps: int = 5000, seed: int = SEED):
+        self.n_steps = n_steps
+        self.seed = seed
+        np.random.seed(seed)
 
-    data = np.zeros((n_steps, n_features), dtype=float)
+    def generate(self) -> pd.DataFrame:
+        t = np.arange(self.n_steps)
 
-    # base signals
-    # seasonal components
-    daily = np.sin(2 * np.pi * (t % 24) / 24)  # daily cycle
-    weekly = np.sin(2 * np.pi * (t % (24 * 7)) / (24 * 7))  # weekly cycle
-    yearly = np.sin(2 * np.pi * (t % (24 * 365)) / (24 * 365))  # yearly (weak given short series)
+        # Trend: quadratic / piecewise to ensure non-stationarity
+        trend = 0.0002 * (t ** 2) / (self.n_steps) + 0.02 * t
 
-    # nonlinear trend
-    trend = 0.0005 * (t**1.5)  # nonlinear upward trend
+        # Seasonality 1: yearly-ish (slow)
+        s1 = 10 * np.sin(2 * np.pi * t / 200)  # period 200
 
-    for i in range(n_features):
-        # unique phase shifts and amplitude per feature
-        phase = (i + 1) * 0.3
-        amp_daily = 1.0 + 0.2 * i
-        amp_weekly = 0.8 + 0.15 * ((-1) ** i)
-        amp_yearly = 0.3 + 0.05 * i
+        # Seasonality 2: weekly-ish (faster)
+        s2 = 3.5 * np.sin(2 * np.pi * t / 30)  # period 30
 
-        # interactions
-        inter = 0.2 * np.cos(2 * np.pi * t / (24 * (i + 2) + 7))  # slow interaction
+        # Intermittent events: spikes / structural breaks
+        spikes = np.zeros_like(t, dtype=float)
+        for loc in [int(self.n_steps*0.2), int(self.n_steps*0.5), int(self.n_steps*0.8)]:
+            spikes[loc:loc+5] += np.linspace(5, 0, 5)
 
-        base = (amp_daily * np.sin(2 * np.pi * t / 24 + phase)
-                + amp_weekly * np.sin(2 * np.pi * t / (24 * 7) + phase * 0.5)
-                + amp_yearly * yearly * (0.5 + 0.1 * i)
-                + 0.5 * trend
-                + inter)
+        # Exogenous slow-moving feature (e.g., temperature-like)
+        exog = 2.0 * np.sin(2 * np.pi * t / 365) + 0.01 * t + np.random.normal(0, 0.3, size=self.n_steps)
 
-        # non-linear distortions for some features
-        if i % 2 == 0:
-            base = base + 0.1 * (np.tanh(0.001 * (t - n_steps / 2)) * (i + 1))
+        # Feature 0: main target-like signal (trend + seasons + noise)
+        noise0 = np.random.normal(0, 1.0 + 0.002 * t, size=self.n_steps)  # heteroscedastic noise
+        feature_0 = trend + s1 + 0.6 * s2 + spikes + noise0
 
-        # controlled noise
-        noise = noise_scale * (1 + 0.1 * i) * np.random.normal(scale=1.0, size=n_steps)
+        # Feature 1: correlated with feature_0 but shifted lags and scaled
+        noise1 = np.random.normal(0, 0.8 + 0.0015 * t, size=self.n_steps)
+        feature_1 = 0.5 * trend + 0.8 * np.roll(s1, 3) + 0.4 * s2 + 0.3 * exog + noise1
 
-        data[:, i] = base + noise
+        # Feature 2: exogenous + interactions
+        noise2 = np.random.normal(0, 0.6 + 0.001 * t, size=self.n_steps)
+        feature_2 = 0.2 * trend - 0.3 * s1 + 1.2 * np.roll(s2, -2) + 0.7 * exog + noise2
 
-    df = pd.DataFrame(data, index=rng, columns=[f"f{i}" for i in range(n_features)])
-    return df
+        df = pd.DataFrame({
+            'feature_0': feature_0,
+            'feature_1': feature_1,
+            'feature_2': feature_2,
+            'exog': exog
+        })
+        # keep only three features as per requirements; we will include exog optionally
+        return df[['feature_0', 'feature_1', 'feature_2']]
 
-print("Generating synthetic dataset...")
-df = generate_multivariate_series(cfg.n_timesteps, cfg.n_features, noise_scale=cfg.noise_scale)
-df.to_csv(os.path.join(cfg.save_dir, "synthetic_multivariate.csv"))
-print("Saved synthetic_multivariate.csv")
-
-# Inspect
-print(df.head())
-
-# -----------------------
-# 2) Data preparation for supervised learning
-# -----------------------
-def create_supervised(df, input_window, horizon, feature_cols=None, target_col="f0"):
-    """
-    Build sliding windows for supervised training.
-    - features: multivariate (all columns)
-    - target: forecast horizon for target_col (multi-step)
-    Returns arrays: X (n_samples, input_window, n_features), y (n_samples, horizon)
-    """
-    if feature_cols is None:
-        feature_cols = df.columns.tolist()
-    data = df[feature_cols].values
-    n = len(df)
-    X, y = [], []
-    for i in range(n - input_window - horizon + 1):
-        X.append(data[i:i + input_window])
-        y.append(data[i + input_window:i + input_window + horizon, feature_cols.index(target_col)])
-    X = np.stack(X)
-    y = np.stack(y)
-    return X, y
-
-feature_cols = df.columns.tolist()
-X_all, y_all = create_supervised(df, cfg.input_window, cfg.forecast_horizon, feature_cols=feature_cols, target_col="f0")
-print("Supervised shapes:", X_all.shape, y_all.shape)
-
-# Train/val/test split (time-ordered)
-n_samples = X_all.shape[0]
-train_end = int(n_samples * 0.7)
-val_end = int(n_samples * 0.85)
-
-X_train, y_train = X_all[:train_end], y_all[:train_end]
-X_val, y_val = X_all[train_end:val_end], y_all[train_end:val_end]
-X_test, y_test = X_all[val_end:], y_all[val_end:]
-
-print("Splits:", X_train.shape, X_val.shape, X_test.shape)
-
-# Scale features (fit on train)
-scaler = StandardScaler()
-n_features = X_train.shape[2]
-# reshape to 2D for scaler
-X_train_flat = X_train.reshape(-1, n_features)
-scaler.fit(X_train_flat)
-def scale_X(X):
-    s = scaler.transform(X.reshape(-1, n_features)).reshape(X.shape)
-    return s
-X_train_s = scale_X(X_train)
-X_val_s = scale_X(X_val)
-X_test_s = scale_X(X_test)
-
-# targets - we standardize target using train target mean/std for stability in training
-target_scaler_mean = y_train.mean()
-target_scaler_std = y_train.std() if y_train.std() > 0 else 1.0
-def scale_y(y): return (y - target_scaler_mean) / target_scaler_std
-def inv_scale_y(y): return y * target_scaler_std + target_scaler_mean
-
-y_train_s = scale_y(y_train)
-y_val_s = scale_y(y_val)
-y_test_s = scale_y(y_test)
-
-# -----------------------
-# 3) PyTorch dataset + model
-# -----------------------
+# ---------------------------
+# 2) Dataset wrapper for PyTorch
+# ---------------------------
 class TimeSeriesDataset(Dataset):
-    def __init__(self, X, y):
-        self.X = X.astype(np.float32)
-        self.y = y.astype(np.float32)
+    """
+    Prepares sliding windows for seq->one forecasting.
+    Each sample: input_seq (seq_len x n_features) -> predict next target (scalar or multi-step)
+    """
+    def __init__(self, data: np.ndarray, seq_len: int = 60, horizon: int = 1, target_col: int = 0, scaler: StandardScaler = None):
+        """
+        data: numpy array shape (n_steps, n_features)
+        seq_len: length of input history
+        horizon: forecast horizon (1 = next step)
+        target_col: which column to predict
+        scaler: optional StandardScaler fitted on train data for scaling inputs
+        """
+        self.data = data
+        self.seq_len = seq_len
+        self.horizon = horizon
+        self.target_col = target_col
+        self.n_steps = data.shape[0]
+        self.n_features = data.shape[1]
+        self.indices = []
+        # build valid start indices
+        for start in range(0, self.n_steps - seq_len - horizon + 1):
+            self.indices.append(start)
+        self.scaler = scaler
 
     def __len__(self):
-        return len(self.X)
+        return len(self.indices)
 
     def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
+        start = self.indices[idx]
+        x = self.data[start: start + self.seq_len]
+        y = self.data[start + self.seq_len + self.horizon - 1, self.target_col]
+        if self.scaler is not None:
+            # apply scaler to input (assume scaler fits features)
+            x = self.scaler.transform(x)
+            # target scaling not applied here; will be handled outside if needed
+        x = torch.tensor(x, dtype=torch.float32)
+        y = torch.tensor(y, dtype=torch.float32)
+        return x, y
 
-train_ds = TimeSeriesDataset(X_train_s, y_train_s)
-val_ds = TimeSeriesDataset(X_val_s, y_val_s)
-test_ds = TimeSeriesDataset(X_test_s, y_test_s)
-
-train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, drop_last=True)
-val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False)
-test_loader = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False)
-
-# Model definition (LSTM encoder + MLP decoder producing multi-step forecast)
-class LSTMForecaster(nn.Module):
-    def __init__(self, n_features, hidden_size=128, num_layers=2, dropout=0.2, horizon=24):
+# ---------------------------
+# 3) Model: LSTM with additive attention (Bahdanau-style)
+# ---------------------------
+class BahdanauAttention(nn.Module):
+    """Additive (Bahdanau) attention over encoder outputs with a query vector (e.g., last hidden state)."""
+    def __init__(self, enc_hidden_dim, dec_hidden_dim, attn_dim):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.lstm = nn.LSTM(input_size=n_features, hidden_size=hidden_size,
-                            num_layers=num_layers, batch_first=True, dropout=dropout)
-        # decoder produces horizon outputs
+        self.W_enc = nn.Linear(enc_hidden_dim, attn_dim, bias=False)
+        self.W_dec = nn.Linear(dec_hidden_dim, attn_dim, bias=False)
+        self.v = nn.Linear(attn_dim, 1, bias=False)
+
+    def forward(self, encoder_outputs, decoder_hidden):
+        """
+        encoder_outputs: (batch, seq_len, enc_hidden_dim)
+        decoder_hidden: (batch, dec_hidden_dim) -- usually last hidden state
+        returns: context (batch, enc_hidden_dim), attn_weights (batch, seq_len)
+        """
+        # Apply linear layers
+        # shape transforms:
+        # W_enc(encoder_outputs) -> (batch, seq_len, attn_dim)
+        # W_dec(decoder_hidden) -> (batch, 1, attn_dim)
+        enc_proj = self.W_enc(encoder_outputs)  # (B, S, A)
+        dec_proj = self.W_dec(decoder_hidden).unsqueeze(1)  # (B, 1, A)
+        score = self.v(torch.tanh(enc_proj + dec_proj)).squeeze(-1)  # (B, S)
+        attn_weights = torch.softmax(score, dim=1)  # (B, S)
+        context = torch.bmm(attn_weights.unsqueeze(1), encoder_outputs).squeeze(1)  # (B, enc_hidden_dim)
+        return context, attn_weights
+
+class LSTMWithAttention(nn.Module):
+    def __init__(self, n_features: int, enc_hidden: int = 64, n_layers: int = 1, dropout: float = 0.1, attn_dim: int = 32, fc_hidden: int = 64):
+        """
+        Encoder-only LSTM with attention pooling for one-step forecast.
+        We use encoder LSTM to produce outputs; use last hidden state as 'query' to attention,
+        compute context vector, then combine and pass through FC to produce prediction.
+        """
+        super().__init__()
+        self.n_features = n_features
+        self.enc_hidden = enc_hidden
+        self.n_layers = n_layers
+        self.lstm = nn.LSTM(input_size=n_features, hidden_size=enc_hidden, num_layers=n_layers, batch_first=True, dropout=dropout if n_layers>1 else 0.0, bidirectional=False)
+        self.attention = BahdanauAttention(enc_hidden_dim=enc_hidden, dec_hidden_dim=enc_hidden, attn_dim=attn_dim)
         self.fc = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
+            nn.Linear(enc_hidden + enc_hidden, fc_hidden),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_size // 2, horizon)
+            nn.Linear(fc_hidden, 1)
         )
 
     def forward(self, x):
-        # x: (batch, seq_len, features)
-        out, (hn, cn) = self.lstm(x)  # out: (batch, seq_len, hidden)
-        last = out[:, -1, :]          # (batch, hidden)
-        y = self.fc(last)             # (batch, horizon)
-        return y
+        """
+        x: (batch, seq_len, n_features)
+        returns: pred (batch,), attn_weights (batch, seq_len)
+        """
+        outputs, (h_n, c_n) = self.lstm(x)  # outputs: (B, S, enc_hidden), h_n: (num_layers, B, enc_hidden)
+        # use last layer's hidden state as decoder_hidden
+        decoder_hidden = h_n[-1]  # (B, enc_hidden)
+        context, attn_weights = self.attention(outputs, decoder_hidden)  # (B, enc_hidden), (B, S)
+        # combine context and decoder hidden
+        combined = torch.cat([context, decoder_hidden], dim=1)  # (B, 2*enc_hidden)
+        out = self.fc(combined).squeeze(-1)  # (B,)
+        return out, attn_weights
 
-# instantiate
-model = LSTMForecaster(n_features=n_features,
-                       hidden_size=cfg.hidden_size,
-                       num_layers=cfg.num_layers,
-                       dropout=cfg.dropout,
-                       horizon=cfg.forecast_horizon).to(cfg.device)
+# ---------------------------
+# 4) Baseline models
+# ---------------------------
+class MLPBaseline(nn.Module):
+    def __init__(self, input_size: int, hidden_sizes: List[int] = [128, 64], dropout: float = 0.1):
+        super().__init__()
+        layers = []
+        in_dim = input_size
+        for h in hidden_sizes:
+            layers.append(nn.Linear(in_dim, h))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout))
+            in_dim = h
+        layers.append(nn.Linear(in_dim, 1))
+        self.net = nn.Sequential(*layers)
 
-# Loss, optimizer, scheduler
-criterion = nn.MSELoss()
-optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr_max, weight_decay=cfg.weight_decay)
+    def forward(self, x):
+        # x shape (batch, seq_len, features) -> flatten
+        x = x.view(x.size(0), -1)
+        return self.net(x).squeeze(-1)
 
-# OneCycleLR scheduler (advanced optimization strategy)
-# OneCycle requires specifying steps_per_epoch
-steps_per_epoch = max(1, len(train_loader))
-scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=cfg.lr_max,
-                                                steps_per_epoch=steps_per_epoch,
-                                                epochs=cfg.epochs,
-                                                pct_start=0.1,
-                                                anneal_strategy="cos",
-                                                final_div_factor=1e4)
+def sarima_forecast(train_series: np.ndarray, test_series: np.ndarray, order=(1,1,1), seasonal_order=(0,1,1,30)):
+    """
+    Train SARIMA on the single target series (univariate) and forecast test length.
+    Returns predictions aligned to test_series length.
+    """
+    # We fit on train_series and forecast len(test_series)
+    model = sm.tsa.statespace.SARIMAX(train_series, order=order, seasonal_order=seasonal_order, enforce_stationarity=False, enforce_invertibility=False)
+    res = model.fit(disp=False)
+    preds = res.forecast(steps=len(test_series))
+    return np.array(preds)
 
-# -----------------------
-# 4) Training loop with early stopping
-# -----------------------
-class EarlyStopping:
-    def __init__(self, patience=8, min_delta=1e-4, restore_best=True):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.best_score = float("inf")
-        self.best_state = None
-        self.wait = 0
-        self.restore_best = restore_best
+# ---------------------------
+# 5) Trainer & Evaluator
+# ---------------------------
+class Trainer:
+    def __init__(self, model: nn.Module, optimizer: torch.optim.Optimizer, criterion, device=DEVICE):
+        self.model = model.to(device)
+        self.optimizer = optimizer
+        self.criterion = criterion
+        self.device = device
 
-    def step(self, current_score, model):
-        if current_score + self.min_delta < self.best_score:
-            self.best_score = current_score
-            self.best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            self.wait = 0
-            return False
+    def train_epoch(self, loader: DataLoader):
+        self.model.train()
+        total_loss = 0.0
+        n = 0
+        for x, y in loader:
+            x = x.to(self.device)
+            y = y.to(self.device)
+            self.optimizer.zero_grad()
+            pred, _ = self.model(x)
+            loss = self.criterion(pred, y)
+            loss.backward()
+            self.optimizer.step()
+            total_loss += loss.item() * x.size(0)
+            n += x.size(0)
+        return total_loss / n
+
+    def validate(self, loader: DataLoader):
+        self.model.eval()
+        total_loss = 0.0
+        n = 0
+        preds = []
+        trues = []
+        with torch.no_grad():
+            for x, y in loader:
+                x = x.to(self.device)
+                y = y.to(self.device)
+                pred, _ = self.model(x)
+                loss = self.criterion(pred, y)
+                total_loss += loss.item() * x.size(0)
+                n += x.size(0)
+                preds.append(pred.cpu().numpy())
+                trues.append(y.cpu().numpy())
+        preds = np.concatenate(preds)
+        trues = np.concatenate(trues)
+        return total_loss / n, preds, trues
+
+    def predict_with_attention(self, loader: DataLoader):
+        """
+        Returns predictions, true values, and attention weights for each batch.
+        attn weights concatenated in order.
+        """
+        self.model.eval()
+        preds = []
+        trues = []
+        attn_all = []
+        with torch.no_grad():
+            for x, y in loader:
+                x = x.to(self.device)
+                y = y.to(self.device)
+                pred, attn = self.model(x)
+                preds.append(pred.cpu().numpy())
+                trues.append(y.cpu().numpy())
+                attn_all.append(attn.cpu().numpy())
+        return np.concatenate(preds), np.concatenate(trues), np.concatenate(attn_all)
+
+# ---------------------------
+# 6) Hyperparameter search (Optuna optional) and training pipeline
+# ---------------------------
+def train_and_evaluate(params: Dict[str, Any], data_train: np.ndarray, data_val: np.ndarray, seq_len: int, horizon: int, target_col: int, scaler: StandardScaler, num_epochs: int = 50, batch_size: int = 64, patience: int = 8):
+    """
+    Trains an LSTMWithAttention model with the provided hyperparameters and returns validation RMSE (lower is better)
+    Also returns the trained model.
+    params keys: enc_hidden, n_layers, dropout, attn_dim, fc_hidden, lr
+    """
+    set_seed(SEED)
+    # Build datasets
+    train_ds = TimeSeriesDataset(data=data_train, seq_len=seq_len, horizon=horizon, target_col=target_col, scaler=scaler)
+    val_ds = TimeSeriesDataset(data=data_val, seq_len=seq_len, horizon=horizon, target_col=target_col, scaler=scaler)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+
+    model = LSTMWithAttention(n_features=data_train.shape[1],
+                              enc_hidden=params['enc_hidden'],
+                              n_layers=params['n_layers'],
+                              dropout=params['dropout'],
+                              attn_dim=params['attn_dim'],
+                              fc_hidden=params['fc_hidden']).to(DEVICE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=params['lr'])
+    criterion = nn.MSELoss()
+    trainer = Trainer(model, optimizer, criterion, device=DEVICE)
+
+    best_val = float('inf')
+    best_state = None
+    epochs_no_improve = 0
+
+    for epoch in range(num_epochs):
+        train_loss = trainer.train_epoch(train_loader)
+        val_loss, _, _ = trainer.validate(val_loader)
+        val_rmse = math.sqrt(val_loss)
+        # simple early stopping on val_loss
+        if val_rmse < best_val - 1e-6:
+            best_val = val_rmse
+            best_state = {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in model.state_dict().items()}
+            epochs_no_improve = 0
         else:
-            self.wait += 1
-            if self.wait >= self.patience:
-                if self.restore_best and self.best_state is not None:
-                    model.load_state_dict(self.best_state)
-                return True
-            return False
+            epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                break
 
-def evaluate(model, loader, criterion):
-    model.eval()
-    losses = []
-    preds = []
-    trues = []
-    with torch.no_grad():
-        for xb, yb in loader:
-            xb = xb.to(cfg.device)
-            yb = yb.to(cfg.device)
-            out = model(xb)
-            loss = criterion(out, yb)
-            losses.append(loss.item())
-            preds.append(out.cpu().numpy())
-            trues.append(yb.cpu().numpy())
-    preds = np.concatenate(preds, axis=0)
-    trues = np.concatenate(trues, axis=0)
-    mean_loss = float(np.mean(losses))
-    return mean_loss, preds, trues
+    # load best state
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return best_val, model
 
-print("Starting training loop...")
-es = EarlyStopping(patience=cfg.early_stop_patience, min_delta=cfg.early_stop_min_delta)
-train_history = {"train_loss": [], "val_loss": []}
+def hp_search_random(data_train, data_val, seq_len, horizon, target_col, scaler, n_trials=20):
+    """
+    Randomized search (fallback) for hyperparameters.
+    """
+    param_space = {
+        'enc_hidden': [32, 64, 128],
+        'n_layers': [1, 2],
+        'dropout': [0.0, 0.1, 0.2, 0.3],
+        'attn_dim': [16, 32, 64],
+        'fc_hidden': [32, 64, 128],
+        'lr': [1e-3, 5e-4, 1e-4]
+    }
+    def sample():
+        return {k: random.choice(v) for k, v in param_space.items()}
 
-for epoch in range(cfg.epochs):
-    model.train()
-    epoch_losses = []
-    for xb, yb in train_loader:
-        xb = xb.to(cfg.device)
-        yb = yb.to(cfg.device)
-        optimizer.zero_grad()
-        out = model(xb)
-        loss = criterion(out, yb)
-        loss.backward()
-        optimizer.step()
-        # scheduler step per batch for OneCycleLR
-        scheduler.step()
-        epoch_losses.append(loss.item())
+    best = (float('inf'), None, None)
+    for i in range(n_trials):
+        params = sample()
+        print(f"[RandomSearch] Trial {i+1}/{n_trials} params: {params}")
+        val_rmse, model = train_and_evaluate(params, data_train, data_val, seq_len, horizon, target_col, scaler, num_epochs=60, batch_size=64, patience=8)
+        print(f" -> val_rmse: {val_rmse:.4f}")
+        if val_rmse < best[0]:
+            best = (val_rmse, params, model)
+    return best  # (best_rmse, best_params, best_model)
 
-    train_loss = float(np.mean(epoch_losses))
-    val_loss, _, _ = evaluate(model, val_loader, criterion)
-    train_history["train_loss"].append(train_loss)
-    train_history["val_loss"].append(val_loss)
+def hp_search_optuna(data_train, data_val, seq_len, horizon, target_col, scaler, n_trials=30):
+    """
+    Bayesian optimization with Optuna (if available).
+    """
+    def objective(trial):
+        params = {
+            'enc_hidden': trial.suggest_categorical('enc_hidden', [32, 64, 128]),
+            'n_layers': trial.suggest_categorical('n_layers', [1, 2]),
+            'dropout': trial.suggest_float('dropout', 0.0, 0.4, step=0.1),
+            'attn_dim': trial.suggest_categorical('attn_dim', [16, 32, 64]),
+            'fc_hidden': trial.suggest_categorical('fc_hidden', [32, 64, 128]),
+            'lr': trial.suggest_loguniform('lr', 1e-4, 1e-2)
+        }
+        val_rmse, _ = train_and_evaluate(params, data_train, data_val, seq_len, horizon, target_col, scaler, num_epochs=50, batch_size=64, patience=8)
+        return val_rmse
 
-    print(f"Epoch {epoch+1}/{cfg.epochs} - train_loss: {train_loss:.6f}  val_loss: {val_loss:.6f}")
+    study = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler(seed=SEED))
+    study.optimize(objective, n_trials=n_trials)
+    best_params = study.best_trial.params
+    # convert float choices to int for certain keys
+    best_params['enc_hidden'] = int(best_params['enc_hidden'])
+    best_params['n_layers'] = int(best_params['n_layers'])
+    best_params['attn_dim'] = int(best_params['attn_dim'])
+    best_params['fc_hidden'] = int(best_params['fc_hidden'])
+    # train final model with best params
+    best_rmse, best_model = train_and_evaluate(best_params, data_train, data_val, seq_len, horizon, target_col, scaler, num_epochs=100, batch_size=64, patience=12)
+    return best_rmse, best_params, best_model
 
-    # early stopping
-    if es.step(val_loss, model):
-        print(f"Early stopping at epoch {epoch+1}")
-        break
+# ---------------------------
+# 7) Full pipeline: prepare splits, scalers, run search, evaluate baselines
+# ---------------------------
+def prepare_data(df: pd.DataFrame, seq_len=60, horizon=1, test_size=0.2, val_size=0.1, target_col=0, scale=True, random_state=SEED):
+    """
+    Splits the dataframe into train/val/test chronologically (no leakage).
+    Returns numpy arrays for train/val/test, fitted scaler for features,
+    and raw target arrays for baseline (for SARIMA).
+    """
+    n = len(df)
+    test_n = int(n * test_size)
+    val_n = int(n * val_size)
+    train_n = n - test_n - val_n
+    train_df = df.iloc[:train_n]
+    val_df = df.iloc[train_n:train_n+val_n]
+    test_df = df.iloc[train_n+val_n:]
 
-# Save model
-model_path = os.path.join(cfg.save_dir, "lstm_forecaster.pth")
-torch.save(model.state_dict(), model_path)
-print(f"Saved model to {model_path}")
+    scaler = None
+    if scale:
+        scaler = StandardScaler()
+        scaler.fit(train_df.values)
 
-# -----------------------
-# 5) Evaluate on test set (DL model)
-# -----------------------
-test_loss, preds_s, trues_s = evaluate(model, test_loader, criterion)
-# inverse-scaling predictions
-preds = inv_scale_y(preds_s)
-trues = inv_scale_y(trues_s)
+    return train_df.values, val_df.values, test_df.values, scaler
 
-# compute metrics (multi-step forecasting; compute per-horizon aggregated metrics)
-def compute_metrics(true, pred):
-    # true/pred shape: (n_samples, horizon)
-    mae = mean_absolute_error(true.flatten(), pred.flatten())
-    rmse = math.sqrt(mean_squared_error(true.flatten(), pred.flatten()))
-    # MAPE: avoid divide-by-zero by small epsilon
-    eps = 1e-8
-    mape = (np.abs((true - pred) / (np.clip(np.abs(true), eps, None)))) * 100.0
-    mape = np.nanmean(mape)
-    return mae, rmse, mape
-
-dl_mae, dl_rmse, dl_mape = compute_metrics(trues, preds)
-print("Deep Learning model test metrics - MAE: {:.4f}, RMSE: {:.4f}, MAPE: {:.2f}%".format(dl_mae, dl_rmse, dl_mape))
-
-# -----------------------
-# 6) Baseline statistical model: SARIMAX (univariate on target f0)
-# -----------------------
-# We'll train SARIMAX on the target series f0 using exogenous variables (other features aggregated)
-# For simplicity, use the same train/val/test splits in time for the original timeseries
-
-target_series = df["f0"]
-# train/end indexes matching supervised windows
-start_idx = cfg.input_window
-end_idx = cfg.input_window + X_all.shape[0] - 1  # inclusive last index that has a target
-
-# Build time-indexed windows to align
-dates_for_targets = df.index[start_idx:end_idx + 1]
-
-# create series for train/val/test aligned with y_all
-target_vals = target_series[start_idx:end_idx + 1].values  # shape (n_samples,)
-
-n_total = len(target_vals)
-train_end_idx = int(n_total * 0.7)
-val_end_idx = int(n_total * 0.85)
-
-sar_train = target_vals[:train_end_idx]
-sar_val = target_vals[train_end_idx:val_end_idx]
-sar_test = target_vals[val_end_idx:]
-
-# Fit SARIMAX on train + val combined to produce one-step-ahead rolling multi-step forecast on test
-# We'll fit on training data and then produce multi-step direct forecasts using dynamic forecasting
-# Choose SARIMAX order via simple heuristics (p,d,q) x (P,D,Q,s) - small model to keep things stable
-sar_order = (1, 1, 1)
-seasonal_order = (1, 0, 1, 24)  # daily seasonality at hourly frequency
-
-print("Fitting SARIMAX baseline...")
-sar_model = SARIMAX(sar_train, order=sar_order, seasonal_order=seasonal_order, enforce_stationarity=False, enforce_invertibility=False)
-sar_res = sar_model.fit(disp=False)
-print("SARIMAX fitted.")
-
-# Rolling multi-step forecast on test set: for each test-origin, forecast horizon steps ahead using model extended
-# We'll use a simple approach: re-fit the model incrementally by appending actuals as we move forward.
-sar_preds = []
-history = list(sar_train.copy())
-for i in range(len(sar_test)):
-    # fit on current history
-    # For speed we won't re-fit at each step; instead use dynamic forecast from last fit for horizon,
-    # but to keep it stable we'll re-fit every 24 steps
-    if i % 24 == 0 and i != 0:
-        sar_res = SARIMAX(np.array(history), order=sar_order, seasonal_order=seasonal_order,
-                          enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
-    # forecast horizon steps ahead from the current point
-    start = len(history)
-    end = len(history) + cfg.forecast_horizon - 1
-    fcast = sar_res.predict(start=start, end=end)
-    # store only the first's horizon aligned across test predictions to match our DL evaluation:
-    sar_preds.append(fcast.values[:cfg.forecast_horizon])
-    # append the true next observation to history (simulate real-time arrival)
-    history.append(sar_test[i])
-
-sar_preds = np.array(sar_preds)  # shape (len(test), horizon)
-sar_trues = []
-# Build corresponding true values from sar_test for horizon windows
-# For each test origin i, the true horizon vector is sar_test[i : i+horizon] with padding if necessary
-for i in range(len(sar_test)):
-    end_idx = i + cfg.forecast_horizon
-    if end_idx <= len(sar_test):
-        sar_trues.append(sar_test[i:end_idx])
+def run_full_experiment(seed=SEED, seq_len=60, horizon=1, target_col=0, use_optuna=False):
+    set_seed(seed)
+    # 1) data generation
+    synth = SyntheticMultivariateSeries(n_steps=4000, seed=seed)
+    df = synth.generate()
+    print("Generated data shape:", df.shape)
+    # 2) split and scaler
+    data_train, data_val, data_test, scaler = prepare_data(df, seq_len=seq_len, horizon=horizon, test_size=0.2, val_size=0.1, target_col=target_col, scale=True, random_state=seed)
+    # We'll also prepare full arrays for dataset creation (train contains both train+val when training final model if desired)
+    print(f"Train/Val/Test sizes: {len(data_train)}/{len(data_val)}/{len(data_test)}")
+    # 3) hyperparameter search
+    if use_optuna and OPTUNA_AVAILABLE:
+        print("Running Optuna hyperparameter search...")
+        best_rmse, best_params, best_model = hp_search_optuna(data_train, data_val, seq_len, horizon, target_col, scaler, n_trials=30)
     else:
-        # pad with last value (not ideal but ensures shapes)
-        needed = end_idx - len(sar_test)
-        pad = np.repeat(sar_test[-1], needed)
-        sar_trues.append(np.concatenate([sar_test[i:], pad]))
-sar_trues = np.array(sar_trues)
+        print("Running randomized hyperparameter search...")
+        best_rmse, best_params, best_model = hp_search_random(data_train, data_val, seq_len, horizon, target_col, scaler, n_trials=20)
 
-# compute metrics
-baseline_mae, baseline_rmse, baseline_mape = compute_metrics(sar_trues, sar_preds)
-print("SARIMAX baseline test metrics - MAE: {:.4f}, RMSE: {:.4f}, MAPE: {:.2f}%".format(baseline_mae, baseline_rmse, baseline_mape))
+    print("Best RMSE (val):", best_rmse)
+    print("Best params:", best_params)
 
-# -----------------------
-# 7) Explainability: Integrated Gradients (Captum) for the DL model
-# -----------------------
-# We'll pick a specific test sample (e.g., middle of test set) and compute IG attribution for inputs (all features across time)
-# Note: IntegratedGradients works with a forward function; we will attribute to the model's output for the first horizon step
-ig = IntegratedGradients(model)
+    # 4) Evaluate on test set and collect attention
+    # create DataLoaders for test
+    test_ds = TimeSeriesDataset(data_test, seq_len=seq_len, horizon=horizon, target_col=target_col, scaler=scaler)
+    test_loader = DataLoader(test_ds, batch_size=64, shuffle=False)
+    trainer = Trainer(best_model, optimizer=None, criterion=None, device=DEVICE)  # optimizer not needed for predict
+    preds, trues, attn_weights = trainer.predict_with_attention(test_loader)
 
-# choose sample index (from test dataset indices)
-sample_idx = max(0, len(test_ds) // 2)
-x_sample, y_sample = test_ds[sample_idx]
-x_tensor = torch.tensor(x_sample[None, ...]).to(cfg.device)  # shape (1, seq, features)
-y_target = 0  # index of the horizon to explain (0..horizon-1); choose first horizon step
+    # Because we scaled inputs only, the target is still in original scale (we didn't scale target), so predictions are in same scale.
+    test_mae = mean_absolute_error(trues, preds)
+    test_rmse = rmse(trues, preds)
+    test_mape = mape(trues, preds)
+    print(f"Test metrics - MAE: {test_mae:.4f}, RMSE: {test_rmse:.4f}, MAPE: {test_mape:.2f}%")
 
-# Define wrapper forward function to return scalar for the target horizon
-def forward_for_ig(input_tensor):
-    # input_tensor: (batch, seq_len, features)
-    out = model(input_tensor)
-    # return the scalar predictions of the target horizon (batch, 1)
-    # Captum expects output shape (batch,) or (batch, n_classes) etc. We'll return (batch,).
-    return out[:, y_target]
+    results = {
+        'model': best_model,
+        'best_params': best_params,
+        'test_metrics': {'mae': test_mae, 'rmse': test_rmse, 'mape': test_mape},
+        'preds': preds,
+        'trues': trues,
+        'attn_weights': attn_weights,
+        'test_df': data_test
+    }
 
-# baseline (reference) input: zero (which corresponds to standardized zero); choose baseline as zeros
-baseline = torch.zeros_like(x_tensor).to(cfg.device)
+    # 5) Baselines
+    # SARIMA: fit on training+validation concatenated target series, forecast for test length (univariate)
+    # For SARIMA we must build the univariate series (target_col)
+    full_series = np.vstack([data_train, data_val, data_test])[:, target_col]
+    train_val_series = full_series[:len(data_train) + len(data_val)]
+    test_series = full_series[len(data_train) + len(data_val):]
 
-# compute attributions
-model.eval()
-with torch.no_grad():
-    # ensure forward_for_ig uses model in eval
-    attr_ig, delta = ig.attribute(x_tensor, baselines=baseline, target=None, return_convergence_delta=True, internal_batch_size=1, n_steps=200)
-# attr_ig shape: (1, seq_len, features)
-attr = attr_ig.squeeze(0).cpu().numpy()
+    # naive SARIMA orders (user may tune further). We'll choose (1,1,1)x(0,1,1,30) to capture seasonality ~30.
+    try:
+        sarima_preds = sarima_forecast(train_val_series, test_series, order=(1,1,1), seasonal_order=(0,1,1,30))
+        sarima_rmse = rmse(test_series, sarima_preds)
+        sarima_mae = mean_absolute_error(test_series, sarima_preds)
+        sarima_mape = mape(test_series, sarima_preds)
+    except Exception as e:
+        print("SARIMA failed:", e)
+        sarima_preds = np.full_like(test_series, np.nan)
+        sarima_rmse = sarima_mae = sarima_mape = float('nan')
 
-# Aggregate attribution across time to get per-feature importance, and across features to get per-time importance
-feature_importance = np.mean(np.abs(attr), axis=0)  # mean over time -> per-feature
-time_importance = np.mean(np.abs(attr), axis=1)     # mean over features -> per-time step
+    print(f"SARIMA metrics - MAE: {sarima_mae:.4f}, RMSE: {sarima_rmse:.4f}, MAPE: {sarima_mape:.2f}%")
 
-# Normalize importance
-feature_importance_norm = feature_importance / (np.sum(feature_importance) + 1e-12)
-time_importance_norm = time_importance / (np.sum(time_importance) + 1e-12)
+    # MLP baseline: train simple MLP with flattened input
+    # Reuse datasets but with MLPBaseline
+    mlp = MLPBaseline(input_size=seq_len * data_train.shape[1], hidden_sizes=[128, 64], dropout=0.1).to(DEVICE)
+    criterion = nn.MSELoss()
+    opt = torch.optim.Adam(mlp.parameters(), lr=1e-3)
+    train_ds = TimeSeriesDataset(data_train, seq_len=seq_len, horizon=horizon, target_col=target_col, scaler=scaler)
+    val_ds = TimeSeriesDataset(data_val, seq_len=seq_len, horizon=horizon, target_col=target_col, scaler=scaler)
+    test_ds = TimeSeriesDataset(data_test, seq_len=seq_len, horizon=horizon, target_col=target_col, scaler=scaler)
+    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=64, shuffle=False)
+    test_loader = DataLoader(test_ds, batch_size=64, shuffle=False)
 
-# Prepare a small textual interpretation
-explanation_lines = []
-explanation_lines.append("Integrated Gradients explanation for test sample index {}".format(sample_idx))
-explanation_lines.append("Target horizon step explained: {}".format(y_target))
-explanation_lines.append("")
-explanation_lines.append("Top feature importances (normalized):")
-for i, val in enumerate(feature_importance_norm):
-    explanation_lines.append(f"  f{i}: {val:.4f}")
+    best_val = float('inf')
+    best_state = None
+    epochs_no_improve = 0
+    for epoch in range(60):
+        # train
+        mlp.train()
+        for x, y in train_loader:
+            x = x.to(DEVICE)
+            y = y.to(DEVICE)
+            opt.zero_grad()
+            pred = mlp(x)
+            loss = criterion(pred, y)
+            loss.backward()
+            opt.step()
+        # validate
+        mlp.eval()
+        vals = []
+        trues_val = []
+        with torch.no_grad():
+            for x, y in val_loader:
+                x = x.to(DEVICE)
+                y = y.to(DEVICE)
+                pred = mlp(x)
+                vals.append(((pred - y) ** 2).cpu().numpy())
+                trues_val.append(y.cpu().numpy())
+        val_rmse = np.sqrt(np.mean(np.concatenate(vals)))
+        if val_rmse < best_val - 1e-6:
+            best_val = val_rmse
+            best_state = {k: v.cpu() for k, v in mlp.state_dict().items()}
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= 8:
+                break
+    if best_state is not None:
+        mlp.load_state_dict(best_state)
+    # test mlp
+    preds_mlp = []
+    trues_mlp = []
+    with torch.no_grad():
+        for x, y in test_loader:
+            x = x.to(DEVICE)
+            pred = mlp(x).cpu().numpy()
+            preds_mlp.append(pred)
+            trues_mlp.append(y.numpy())
+    preds_mlp = np.concatenate(preds_mlp)
+    trues_mlp = np.concatenate(trues_mlp)
+    mlp_rmse = rmse(trues_mlp, preds_mlp)
+    mlp_mae = mean_absolute_error(trues_mlp, preds_mlp)
+    mlp_mape = mape(trues_mlp, preds_mlp)
+    print(f"MLP baseline metrics - MAE: {mlp_mae:.4f}, RMSE: {mlp_rmse:.4f}, MAPE: {mlp_mape:.2f}%")
 
-explanation_lines.append("")
-explanation_lines.append("Top time-steps (relative, 0 is oldest in input window, {} is last):".format(cfg.input_window-1))
-top_time_idx = np.argsort(-time_importance_norm)[:8]
-for idx in top_time_idx:
-    explanation_lines.append(f"  t={idx} (relative) : importance {time_importance_norm[idx]:.4f}")
+    results['baselines'] = {
+        'sarima': {'preds': sarima_preds, 'mae': sarima_mae, 'rmse': sarima_rmse, 'mape': sarima_mape},
+        'mlp': {'preds': preds_mlp, 'mae': mlp_mae, 'rmse': mlp_rmse, 'mape': mlp_mape}
+    }
 
-explanation_text = "\n".join(explanation_lines)
-print("\n" + explanation_text)
+    return results, df
 
-# Save explanation and attribution arrays
-np.save(os.path.join(cfg.save_dir, "ig_attr_sample.npy"), attr)
-with open(os.path.join(cfg.save_dir, "explanation_text.txt"), "w") as f:
-    f.write(explanation_text)
-print("Saved IG attribution and textual explanation to results directory.")
-
-# -----------------------
-# 8) Comparative report (text file) and simple plots
-# -----------------------
-report_lines = []
-report_lines.append("Advanced Time Series Forecasting Report\n")
-report_lines.append("Dataset: synthetic multivariate ({} features), {} timesteps".format(cfg.n_features, cfg.n_timesteps))
-report_lines.append("\nModel configuration (Deep Learning - LSTM):")
-report_lines.append(f"  input_window: {cfg.input_window}, forecast_horizon: {cfg.forecast_horizon}")
-report_lines.append(f"  hidden_size: {cfg.hidden_size}, num_layers: {cfg.num_layers}, dropout: {cfg.dropout}")
-report_lines.append(f"  optimizer: AdamW, OneCycleLR, max_lr: {cfg.lr_max}, weight_decay: {cfg.weight_decay}")
-report_lines.append("")
-report_lines.append("Training details:")
-report_lines.append(f"  epochs run: {epoch+1}, early stopping patience: {cfg.early_stop_patience}")
-report_lines.append("")
-report_lines.append("Evaluation (test set aggregated over all horizons):")
-report_lines.append(f"  Deep Learning (LSTM) - MAE: {dl_mae:.6f}, RMSE: {dl_rmse:.6f}, MAPE: {dl_mape:.2f}%")
-report_lines.append(f"  Baseline (SARIMAX)    - MAE: {baseline_mae:.6f}, RMSE: {baseline_rmse:.6f}, MAPE: {baseline_mape:.2f}%")
-report_lines.append("")
-report_lines.append("Integrated Gradients interpretation (saved in explanation_text.txt)")
-report_lines.append("")
-report_lines.append("Hyperparameter choices reasoning:")
-report_lines.append("  - hidden_size chosen to balance capacity and overfitting for hourly time-series.")
-report_lines.append("  - OneCycleLR used to accelerate training and achieve robust generalization.")
-report_lines.append("  - Early stopping to avoid overfitting on validation loss.")
-report_lines.append("")
-report_lines.append("Files produced in results directory:")
-for fname in os.listdir(cfg.save_dir):
-    report_lines.append("  - " + fname)
-
-report_text = "\n".join(report_lines)
-with open(os.path.join(cfg.save_dir, "report_summary.txt"), "w") as f:
-    f.write(report_text)
-print("Saved report_summary.txt")
-
-# Optional: small plots of train/val loss and attribution heatmap
-try:
-    plt.figure(figsize=(8, 4))
-    plt.plot(train_history["train_loss"], label="train_loss")
-    plt.plot(train_history["val_loss"], label="val_loss")
+# ---------------------------
+# 8) Visualization helpers
+# ---------------------------
+def plot_predictions(trues, preds, title="Predictions vs True", n_plot=200, savepath=None):
+    n = min(n_plot, len(trues))
+    t = np.arange(n)
+    plt.figure(figsize=(12,4))
+    plt.plot(t, trues[:n], label="True")
+    plt.plot(t, preds[:n], label="Predicted")
+    plt.title(title)
     plt.legend()
-    plt.title("Loss curves")
     plt.tight_layout()
-    plt.savefig(os.path.join(cfg.save_dir, "loss_curve.png"))
+    if savepath:
+        plt.savefig(savepath)
+    else:
+        plt.show()
     plt.close()
 
-    # Attribution heatmap (time x features)
-    plt.figure(figsize=(10, 4))
-    plt.imshow(np.abs(attr).T, aspect="auto")
-    plt.colorbar(label="abs attribution")
-    plt.xlabel("time (relative)")
-    plt.ylabel("feature")
-    plt.yticks(ticks=np.arange(n_features), labels=feature_cols)
-    plt.title("IG absolute attribution (features x time)")
+def visualize_attention_for_sample(input_sequence: np.ndarray, attn_weights: np.ndarray, feature_names: List[str] = None, savepath=None, title=None):
+    """
+    input_sequence: (seq_len, n_features) original (unscaled) or scaled values for a single sample
+    attn_weights: (seq_len,) attention weights (must sum to 1)
+    """
+    seq_len, n_features = input_sequence.shape
+    if feature_names is None:
+        feature_names = [f"f{i}" for i in range(n_features)]
+    # Plot attention as a heatmap per feature over time: multiply each feature time series by attention weights (broadcast)
+    weighted = input_sequence * attn_weights[:, None]  # (S, F)
+    # create figure showing attention weights bar and weighted signals overlay
+    fig, axs = plt.subplots(2, 1, figsize=(12, 6), gridspec_kw={'height_ratios':[1,2]})
+    axs[0].bar(np.arange(seq_len), attn_weights)
+    axs[0].set_title('Attention weights over input time steps')
+    axs[0].set_xlabel('time step (relative, most recent at right)')
+    axs[0].set_ylabel('weight')
+
+    for i in range(n_features):
+        axs[1].plot(np.arange(seq_len), input_sequence[:, i], label=feature_names[i], alpha=0.8)
+    axs[1].set_title('Input features (original scale)')
+    axs[1].legend(ncol=min(n_features, 4))
     plt.tight_layout()
-    plt.savefig(os.path.join(cfg.save_dir, "ig_heatmap.png"))
-    plt.close()
-    print("Saved loss_curve.png and ig_heatmap.png")
-except Exception as e:
-    print("Plotting skipped or failed:", e)
+    if savepath:
+        plt.savefig(savepath)
+        plt.close()
+    else:
+        plt.show()
 
-# -----------------------
-# 9) Example: show a sample forecast comparison (print)
-# -----------------------
-# Take first 3 test samples and show predicted vs true for DL and baseline
-n_show = min(3, len(preds))
-print("\nSample forecasts (first {} test origins):".format(n_show))
-for i in range(n_show):
-    print(f"\nOrigin {i}:")
-    print(" True (first 8 steps):", np.round(trues[i][:8], 4))
-    print(" DL pred:", np.round(preds[i][:8], 4))
-    # baseline index maps to the same aligned test origin
-    print(" Baseline pred:", np.round(sar_preds[i][:8], 4))
+# ---------------------------
+# 9) Main: run experiment and produce artifacts
+# ---------------------------
+if __name__ == "__main__":
+    # Parameters (user can modify these)
+    SEED = 42
+    seq_len = 120          # history window length
+    horizon = 1            # one-step ahead forecasting
+    target_col = 0
+    use_optuna = OPTUNA_AVAILABLE  # set False to force randomized search
+    set_seed(SEED)
 
-# final note saved
-with open(os.path.join(cfg.save_dir, "README.txt"), "w") as f:
-    f.write("Results directory for Advanced Time Series Forecasting project.\n"
-            "Contains: synthetic_multivariate.csv, lstm_forecaster.pth, report_summary.txt, explanation_text.txt, ig_attr_sample.npy, loss_curve.png, ig_heatmap.png\n")
-print("\nAll done. Results saved in", cfg.save_dir)
+    # Run experiment
+    results, df = run_full_experiment(seed=SEED, seq_len=seq_len, horizon=horizon, target_col=target_col, use_optuna=use_optuna)
+
+    # Print final report (summary)
+    print("\n=== EXPERIMENT SUMMARY ===")
+    print("Best model params:", results['best_params'])
+    print("Test metrics (LSTM+Attn):", results['test_metrics'])
+    print("MLP baseline metrics:", results['baselines']['mlp']['mae'], results['baselines']['mlp']['rmse'], results['baselines']['mlp']['mape'])
+    print("SARIMA baseline metrics:", results['baselines']['sarima']['mae'], results['baselines']['sarima']['rmse'], results['baselines']['sarima']['mape'])
+
+    # Save some artifacts locally
+    os.makedirs("artifacts", exist_ok=True)
+    # 1) Plot sample predictions
+    plot_predictions(results['trues'], results['preds'], title="LSTM-Attn Predictions vs True (test subset)", n_plot=400, savepath="artifacts/predictions_lstm_attn.png")
+    plot_predictions(results['trues'], results['baselines']['mlp']['preds'], title="MLP Predictions vs True (test subset)", n_plot=400, savepath="artifacts/predictions_mlp.png")
+    if not np.all(np.isnan(results['baselines']['sarima']['preds'])):
+        plot_predictions(results['trues'], results['baselines']['sarima']['preds'], title="SARIMA Predictions vs True (test subset)", n_plot=400, savepath="artifacts/predictions_sarima.png")
+
+    # 2) Attention visualization for a few test samples
+    # Note: attn_weights array shape (num_test_samples, seq_len)
+    attn = results['attn_weights']
+    # We also want the corresponding input sequences (unscaled) for the test set to plot real values
+    # Build test dataset without scaler to access original raw input sequences (for few examples)
+    synth = SyntheticMultivariateSeries(n_steps=4000, seed=SEED)
+    full_df = synth.generate()
+    # We must index into the test portion where test_ds indices start after train+val
+    n = len(full_df)
+    test_n = int(n * 0.2)
+    val_n = int(n * 0.1)
+    train_n = n - test_n - val_n
+    raw_test_df = full_df.iloc[train_n+val_n:].values  # shape: (test_n, n_features)
+    # For each sample in test DataLoader, the corresponding input sequence uses seq_len rows prior to the target index.
+    # We'll visualize attention for the first 3 test samples
+    num_samples_to_plot = min(3, attn.shape[0])
+    example_dir = "artifacts/attention_examples"
+    os.makedirs(example_dir, exist_ok=True)
+    for i in range(num_samples_to_plot):
+        # The ith sample in the dataset corresponds to input rows [i : i+seq_len] of raw_test_df
+        # because TimeSeriesDataset indices start at 0 for the test partition
+        input_seq = raw_test_df[i: i+seq_len]  # (seq_len, n_features)
+        # attn weights for sample i:
+        attn_i = attn[i]  # (seq_len,)
+        # Normalize (should already sum to 1)
+        attn_i = attn_i / (attn_i.sum() + 1e-12)
+        plot_path = os.path.join(example_dir, f"attn_sample_{i}.png")
+        visualize_attention_for_sample(input_seq, attn_i, feature_names=list(full_df.columns), savepath=plot_path)
+        print(f"Saved attention visualization for sample {i} to {plot_path}")
+
+    print("Artifacts saved in ./artifacts (plots, attention visualizations).")
+    print("End of script.")
